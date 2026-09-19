@@ -87,8 +87,7 @@ jobs:
               print("JSON CHANGED!")
 
               message = (
-                  "🚨 JSON changed!\n\n"
-                  "The monitored API response has changed."
+                  "JSON changed!"
               )
 
               params = urllib.parse.urlencode({
