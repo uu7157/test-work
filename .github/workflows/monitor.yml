@@ -19,51 +19,59 @@ jobs:
     runs-on: ubuntu-slim
 
     steps:
-      - name: Restore previous state
-        id: cache-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: .monitor-state
-          key: json-monitor-state-${{ github.run_id }}
-          restore-keys: |
-            json-monitor-state-
-
       - name: Check API
-        id: check
         env:
           API_URL_B64: ${{ secrets.API_URL_B64 }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_VARIABLE_TOKEN: ${{ secrets.GH_VARIABLE_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python3 <<'PY'
           import base64
           import hashlib
           import json
           import os
+          import urllib.error
           import urllib.parse
           import urllib.request
 
-          # Decode the API URL from the GitHub Secret.
-          url = base64.b64decode(
+          # ------------------------------------------------------------
+          # Configuration
+          # ------------------------------------------------------------
+
+          variable_name = "JSON_MONITOR_HASH"
+
+          api_url = base64.b64decode(
               os.environ["API_URL_B64"]
           ).decode("utf-8")
 
-          # Make the request.
+          repository = os.environ["GITHUB_REPOSITORY"]
+          github_token = os.environ["GH_VARIABLE_TOKEN"]
+
+          # ------------------------------------------------------------
+          # Fetch API
+          # ------------------------------------------------------------
+
           request = urllib.request.Request(
-              url,
+              api_url,
               headers={
                   "User-Agent": "okhttp/4.10.0"
               }
           )
 
-          with urllib.request.urlopen(request, timeout=30) as response:
+          with urllib.request.urlopen(
+              request,
+              timeout=30
+          ) as response:
               raw = response.read()
 
-          # Parse JSON.
+          # ------------------------------------------------------------
+          # Parse and normalize JSON
+          # ------------------------------------------------------------
+
           data = json.loads(raw)
 
-          # Normalize JSON so insignificant formatting/key-order
-          # differences don't count as changes.
           normalized = json.dumps(
               data,
               sort_keys=True,
@@ -75,25 +83,82 @@ jobs:
               normalized.encode("utf-8")
           ).hexdigest()
 
-          os.makedirs(".monitor-state", exist_ok=True)
+          print("Current JSON hash:", current_hash)
 
-          state_file = ".monitor-state/hash"
+          # ------------------------------------------------------------
+          # GitHub Variables API helpers
+          # ------------------------------------------------------------
+
+          github_api_base = (
+              "https://api.github.com/repos/"
+              + repository
+              + "/actions/variables/"
+          )
+
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": "Bearer " + github_token,
+              "X-GitHub-Api-Version": "2026-03-10",
+              "Content-Type": "application/json"
+          }
+
+          variable_url = (
+              github_api_base
+              + urllib.parse.quote(
+                  variable_name,
+                  safe=""
+              )
+          )
+
+          # ------------------------------------------------------------
+          # Read previous hash
+          # ------------------------------------------------------------
+
           old_hash = ""
 
-          if os.path.exists(state_file):
-              with open(state_file, "r") as f:
-                  old_hash = f.read().strip()
+          get_request = urllib.request.Request(
+              variable_url,
+              headers=headers,
+              method="GET"
+          )
 
-          # First run: establish a baseline.
+          try:
+              with urllib.request.urlopen(
+                  get_request,
+                  timeout=30
+              ) as response:
+                  variable_data = json.loads(
+                      response.read()
+                  )
+
+              old_hash = variable_data.get(
+                  "value",
+                  ""
+              ).strip()
+
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+
+              print(
+                  "No previous state variable found. "
+                  "This is the first run."
+              )
+
+          # ------------------------------------------------------------
+          # Compare hashes
+          # ------------------------------------------------------------
+
           if not old_hash:
-              print("First run. Establishing baseline.")
+              print(
+                  "First run. Establishing baseline. "
+                  "No Telegram notification."
+              )
 
           elif current_hash != old_hash:
               print("JSON CHANGED!")
 
-              message = (
-                  "JSON changed!"
-              )
+              message = "JSON changed!"
 
               params = urllib.parse.urlencode({
                   "chat_id": os.environ["TELEGRAM_CHAT_ID"],
@@ -118,13 +183,59 @@ jobs:
           else:
               print("No change.")
 
-          # Save the current hash for the next run.
-          with open(state_file, "w") as f:
-              f.write(current_hash)
-          PY
+          # ------------------------------------------------------------
+          # Save current hash to GitHub repository variable
+          # ------------------------------------------------------------
 
-      - name: Save current state
-        uses: actions/cache/save@v4
-        with:
-          path: .monitor-state
-          key: json-monitor-state-${{ github.run_id }}
+          payload = json.dumps({
+              "name": variable_name,
+              "value": current_hash
+          }).encode("utf-8")
+
+          # Try to update existing variable.
+          update_request = urllib.request.Request(
+              variable_url,
+              data=payload,
+              headers=headers,
+              method="PATCH"
+          )
+
+          try:
+              with urllib.request.urlopen(
+                  update_request,
+                  timeout=30
+              ) as response:
+                  response.read()
+
+              print(
+                  "State saved to GitHub repository variable."
+              )
+
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+
+              # Variable doesn't exist yet, so create it.
+              create_url = (
+                  "https://api.github.com/repos/"
+                  + repository
+                  + "/actions/variables"
+              )
+
+              create_request = urllib.request.Request(
+                  create_url,
+                  data=payload,
+                  headers=headers,
+                  method="POST"
+              )
+
+              with urllib.request.urlopen(
+                  create_request,
+                  timeout=30
+              ) as response:
+                  response.read()
+
+              print(
+                  "State variable created successfully."
+              )
+          PY
